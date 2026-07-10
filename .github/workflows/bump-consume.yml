@@ -56,6 +56,11 @@ on:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    # github.token needs packages:read for the npm-ghpackages proto resolve;
+    # all mutating git/PR operations use the App token instead.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Mint GitHub App token
         id: app
@@ -193,7 +198,11 @@ jobs:
           PKG: ${{ inputs.package }}
           T: ${{ steps.v.outputs.target }}
           NEWSPEC: ${{ steps.v.outputs.newspec }}
-          APP_TOKEN: ${{ steps.app.outputs.token }}
+          # GitHub Packages npm reads use the run's GITHUB_TOKEN, NOT the App
+          # token: App installation tokens are rejected by npm.pkg.github.com
+          # (403), whereas GITHUB_TOKEN reads a public same-org package fine
+          # (this is the token the proto publish workflow already uses).
+          GH_PKG_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           case "$ECO" in
@@ -235,9 +244,9 @@ jobs:
                 fs.writeFileSync("package.json", JSON.stringify(j,null,2)+"\n");
               '
               # Supply GitHub Packages auth via a temp userconfig .npmrc so the
-              # repo's own .npmrc is not modified/committed. App packages:write covers read.
-              printf '@multiagentcoordinationprotocol:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$APP_TOKEN" > "$RUNNER_TEMP/ghpkg.npmrc"
-              NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/ghpkg.npmrc" NODE_AUTH_TOKEN="$APP_TOKEN" npm install --package-lock-only ;;
+              # repo's own .npmrc is not modified/committed.
+              printf '@multiagentcoordinationprotocol:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$GH_PKG_TOKEN" > "$RUNNER_TEMP/ghpkg.npmrc"
+              NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/ghpkg.npmrc" NODE_AUTH_TOKEN="$GH_PKG_TOKEN" npm install --package-lock-only ;;
             pip)
               # Range-widen only (no lockfile): rewrite this package's constraint.
               PKG="$PKG" NEWSPEC="$NEWSPEC" perl -i -pe 's/"\Q$ENV{PKG}\E[^"]*"/"$ENV{PKG}$ENV{NEWSPEC}"/' pyproject.toml ;;
