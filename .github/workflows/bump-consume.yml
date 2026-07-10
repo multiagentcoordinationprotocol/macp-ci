@@ -1,0 +1,271 @@
+name: bump-consume
+
+# Reusable "consume a new macp dependency release" for every consumer repo.
+# Called by a thin bump-proto.yml / bump-sdk.yml (repository_dispatch +
+# workflow_dispatch). It resolves the target version, waits for the registry to
+# serve it, edits the manifest + lockfile for the given ecosystem, opens a bump
+# PR, and — for a non-breaking bump — arms auto-merge.
+#
+# Auth: the macp-deps-bot GitHub App (org secrets MACP_BOT_APP_ID /
+# MACP_BOT_PRIVATE_KEY). Installation tokens trigger CI on the bot PR (which
+# GITHUB_TOKEN cannot) — so there are no PATs anywhere. The App token also
+# authenticates GitHub Packages reads for the npm-ghpackages ecosystem.
+#
+# Ecosystems:
+#   cargo          — crates.io; edits [workspace.dependencies] in place + re-lock
+#   npm            — public npm; rewrites dep + re-lock
+#   npm-ghpackages — @…/proto from GitHub Packages; version comes from the
+#                    dispatch payload (GH Packages needs auth to resolve), lock
+#                    regenerated with an App-token .npmrc
+#   pip            — setuptools, NO lockfile; range-widen only. An in-range
+#                    version is a no-op (pip resolves latest-in-range at build);
+#                    an out-of-range version opens a PR widening pyproject ranges.
+#
+# Caller shape:
+#   on:
+#     repository_dispatch: { types: [proto-released] }
+#     workflow_dispatch:   { inputs: { version: { required: false, default: '' } } }
+#   jobs:
+#     bump:
+#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/bump-consume.yml@v1
+#       with:  { ecosystem: cargo, package: macp-proto }
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      ecosystem:
+        description: 'cargo | npm | npm-ghpackages | pip'
+        required: true
+        type: string
+      package:
+        description: 'Dependency name as it appears in this repo''s manifest'
+        required: true
+        type: string
+      version:
+        description: 'Explicit version (manual dispatch); blank = event payload or (public) registry latest'
+        required: false
+        type: string
+        default: ''
+      allow-major:
+        description: 'Arm auto-merge even on a major bump'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.MACP_BOT_APP_ID }}
+          private-key: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - uses: actions/setup-node@v4
+        if: ${{ inputs.ecosystem == 'npm' || inputs.ecosystem == 'npm-ghpackages' }}
+        with:
+          node-version: '22'
+
+      - name: Resolve versions
+        id: v
+        env:
+          ECO: ${{ inputs.ecosystem }}
+          PKG: ${{ inputs.package }}
+          MANUAL: ${{ inputs.version }}
+          EVENT: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          TARGET="${EVENT:-$MANUAL}"
+
+          # For public registries we can resolve "latest" when no version is
+          # supplied. GitHub Packages cannot be resolved without auth, so
+          # npm-ghpackages REQUIRES an explicit/payload version.
+          if [ -z "$TARGET" ]; then
+            case "$ECO" in
+              npm)   TARGET=$(npm view "$PKG" version) ;;
+              cargo) TARGET=$(curl -fsSL -A 'macp-ci-bump' "https://crates.io/api/v1/crates/$PKG" | jq -r '.crate.max_stable_version') ;;
+              pip)   TARGET=$(curl -fsSL "https://pypi.org/pypi/$PKG/json" | jq -r '.info.version') ;;
+              npm-ghpackages) echo "::error::npm-ghpackages requires an explicit version (payload or manual input) — GitHub Packages cannot be resolved unauthenticated"; exit 1 ;;
+              *) echo "::error::unknown ecosystem $ECO"; exit 1 ;;
+            esac
+          fi
+          TARGET="${TARGET#v}"
+
+          # Semver helpers (portable, no python)
+          major() { echo "${1%%.*}"; }
+          minor() { echo "$1" | cut -d. -f2; }
+          ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }   # $1 >= $2
+          lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }  # $1 < $2
+
+          FLOOR=""; CEIL=""
+          case "$ECO" in
+            cargo)
+              CURRENT=$(PKG="$PKG" perl -ne 'BEGIN{$p=quotemeta($ENV{PKG})} if(/^\s*$p\s*=/){ if(/version\s*=\s*"([^"]+)"/){print $1} elsif(/=\s*"([^"]+)"/){print $1} exit }' Cargo.toml) ;;
+            npm|npm-ghpackages)
+              CURRENT=$(node -e "const j=require('./package.json');const p=process.env.PKG;const s=(j.dependencies&&j.dependencies[p])||(j.devDependencies&&j.devDependencies[p])||'';process.stdout.write(String(s).replace(/^[^0-9]*/,''))") ;;
+            pip)
+              SPEC=$(PKG="$PKG" perl -ne 'BEGIN{$p=quotemeta($ENV{PKG})} if(/"$p([^"]*)"/){print $1; exit}' pyproject.toml)
+              old_ifs="$IFS"; IFS=','
+              for part in $SPEC; do
+                part="$(echo "$part" | tr -d '[:space:]')"
+                case "$part" in
+                  '>='*) FLOOR="${part#>=}" ;;
+                  '<='*) : ;;
+                  '<'*)  CEIL="${part#<}" ;;
+                  '=='*) FLOOR="${part#==}"; CEIL="${part#==}" ;;
+                esac
+              done
+              IFS="$old_ifs"
+              CURRENT="$FLOOR" ;;
+          esac
+
+          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "branch=deps/$PKG-$TARGET" >> "$GITHUB_OUTPUT"
+
+          # breaking = crosses a major boundary, OR a 0.x minor boundary.
+          BREAKING=false
+          if [ -n "$CURRENT" ]; then
+            if [ "$(major "$TARGET")" != "$(major "$CURRENT")" ]; then BREAKING=true
+            elif [ "$(major "$TARGET")" = "0" ] && [ "$(minor "$TARGET")" != "$(minor "$CURRENT")" ]; then BREAKING=true; fi
+          fi
+          echo "breaking=$BREAKING" >> "$GITHUB_OUTPUT"
+
+          CHANGED=true
+          if [ "$ECO" = "pip" ]; then
+            # In-range publishes need no PR — pip resolves latest-in-range at build.
+            INRANGE=true
+            if [ -n "$FLOOR" ] && ! ge "$TARGET" "$FLOOR"; then INRANGE=false; fi
+            if [ -n "$CEIL" ]  && ! lt "$TARGET" "$CEIL";  then INRANGE=false; fi
+            [ "$INRANGE" = "true" ] && CHANGED=false
+            # Widened ceiling = next patch above target (so target is admissible).
+            oi="$IFS"; IFS=.; set -- $TARGET; IFS="$oi"
+            NEWCEIL="${1:-0}.${2:-0}.$(( ${3:-0} + 1 ))"
+            # Lower the floor only if target sits below it.
+            NEWFLOOR="$FLOOR"
+            if [ -n "$FLOOR" ] && lt "$TARGET" "$FLOOR"; then NEWFLOOR="$TARGET"; fi
+            if [ -n "$NEWFLOOR" ]; then NEWSPEC=">=$NEWFLOOR,<$NEWCEIL"; else NEWSPEC="<$NEWCEIL"; fi
+            echo "newspec=$NEWSPEC" >> "$GITHUB_OUTPUT"
+          else
+            [ "$CURRENT" = "$TARGET" ] && CHANGED=false
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "$PKG $CURRENT -> $TARGET (eco=$ECO changed=$CHANGED breaking=$BREAKING)"
+
+      - name: Branch already open?
+        if: ${{ steps.v.outputs.changed == 'true' }}
+        id: br
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "${{ steps.v.outputs.branch }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "PR branch already exists."
+          else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Wait for registry to serve the version
+        if: ${{ steps.v.outputs.changed == 'true' && steps.br.outputs.exists == 'false' && inputs.ecosystem != 'npm-ghpackages' }}
+        env:
+          ECO: ${{ inputs.ecosystem }}
+          PKG: ${{ inputs.package }}
+          T: ${{ steps.v.outputs.target }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 24); do
+            case "$ECO" in
+              npm)   [ "$(npm view "$PKG@$T" version 2>/dev/null || true)" = "$T" ] && { echo ok; exit 0; } ;;
+              cargo) curl -fsSL -A 'macp-ci-bump' "https://crates.io/api/v1/crates/$PKG/$T" >/dev/null 2>&1 && { echo ok; exit 0; } ;;
+              pip)   curl -fsSL "https://pypi.org/pypi/$PKG/$T/json" >/dev/null 2>&1 && { echo ok; exit 0; } ;;
+            esac
+            echo "waiting for $PKG@$T ($i/24)…"; sleep 5
+          done
+          echo "::error::$PKG@$T not on the registry after ~2 min"; exit 1
+
+      - name: Apply bump (manifest + lockfile)
+        if: ${{ steps.v.outputs.changed == 'true' && steps.br.outputs.exists == 'false' }}
+        env:
+          ECO: ${{ inputs.ecosystem }}
+          PKG: ${{ inputs.package }}
+          T: ${{ steps.v.outputs.target }}
+          NEWSPEC: ${{ steps.v.outputs.newspec }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          case "$ECO" in
+            cargo)
+              command -v cargo >/dev/null || { curl -fsSL --proto "=https" --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1; }
+              source "$HOME/.cargo/env" 2>/dev/null || true
+              # Bump the requirement in Cargo.toml in place — preserving features /
+              # table form, covering [dependencies] and [workspace.dependencies].
+              PKG="$PKG" T="$T" perl -i -pe '
+                my $p = quotemeta($ENV{PKG}); my $v = $ENV{T};
+                if (/^\s*$p\s*=/) {
+                  if (/\{/) { s/(version\s*=\s*")[^"]+(")/$1$v$2/ }
+                  else      { s/=\s*"[^"]+"/= "$v"/ }
+                }
+              ' Cargo.toml
+              cargo update -p "$PKG" --precise "$T" ;;
+            npm)
+              node -e '
+                const fs=require("fs"), pkg=process.env.PKG, T=process.env.T;
+                const j=JSON.parse(fs.readFileSync("package.json","utf8"));
+                for (const sec of ["dependencies","devDependencies","optionalDependencies"]) {
+                  const d=j[sec]; if(!d) continue;
+                  for (const k of Object.keys(d)) {
+                    if (k===pkg) d[k]="^"+T;
+                    else if (typeof d[k]==="string" && d[k].startsWith("npm:"+pkg+"@")) d[k]="npm:"+pkg+"@^"+T;
+                  }
+                }
+                fs.writeFileSync("package.json", JSON.stringify(j,null,2)+"\n");
+              '
+              npm install --package-lock-only ;;
+            npm-ghpackages)
+              node -e '
+                const fs=require("fs"), pkg=process.env.PKG, T=process.env.T;
+                const j=JSON.parse(fs.readFileSync("package.json","utf8"));
+                for (const sec of ["dependencies","devDependencies","optionalDependencies"]) {
+                  const d=j[sec]; if(!d) continue;
+                  for (const k of Object.keys(d)) if (k===pkg) d[k]="^"+T;
+                }
+                fs.writeFileSync("package.json", JSON.stringify(j,null,2)+"\n");
+              '
+              # Supply GitHub Packages auth via a temp userconfig .npmrc so the
+              # repo's own .npmrc is not modified/committed. App packages:write covers read.
+              printf '@multiagentcoordinationprotocol:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$APP_TOKEN" > "$RUNNER_TEMP/ghpkg.npmrc"
+              NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/ghpkg.npmrc" NODE_AUTH_TOKEN="$APP_TOKEN" npm install --package-lock-only ;;
+            pip)
+              # Range-widen only (no lockfile): rewrite this package's constraint.
+              PKG="$PKG" NEWSPEC="$NEWSPEC" perl -i -pe 's/"\Q$ENV{PKG}\E[^"]*"/"$ENV{PKG}$ENV{NEWSPEC}"/' pyproject.toml ;;
+          esac
+
+      - name: Open PR + arm auto-merge
+        if: ${{ steps.v.outputs.changed == 'true' && steps.br.outputs.exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PKG: ${{ inputs.package }}
+          BR: ${{ steps.v.outputs.branch }}
+          CUR: ${{ steps.v.outputs.current }}
+          T: ${{ steps.v.outputs.target }}
+          BREAKING: ${{ steps.v.outputs.breaking }}
+          ALLOW_MAJOR: ${{ inputs.allow-major }}
+        run: |
+          set -euo pipefail
+          git config user.name 'macp-deps-bot[bot]'
+          git config user.email '${{ steps.app.outputs.app-slug }}[bot]@users.noreply.github.com'
+          git checkout -b "$BR"
+          git add -A
+          if git diff --cached --quiet; then echo "No file changes to commit — nothing to bump."; exit 0; fi
+          git commit -m "chore(deps): bump $PKG to $T"
+          git push -u origin "$BR"
+          NOTE=""; [ "$BREAKING" = "true" ] && NOTE=$'\n\n> ⚠️ **Breaking bump held** — auto-merge is NOT armed; review and merge manually.'
+          gh pr create --base "${GITHUB_REF_NAME}" --head "$BR" \
+            --title "chore(deps): bump $PKG to $T" \
+            --body "Event-driven bump of \`$PKG\` $CUR → $T, dispatched on publish.$NOTE"
+          if [ "$ALLOW_MAJOR" = "true" ] || [ "$BREAKING" = "false" ]; then
+            gh pr merge --auto --squash "$BR"
+          fi
