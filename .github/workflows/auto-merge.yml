@@ -10,12 +10,24 @@ name: auto-merge
 # Convention: third-party actions are SHA-pinned; first-party actions/* are
 # trusted by major tag.
 #
-# Each repo calls this with a 6-line thin workflow:
+# Auth: the merge is armed with a macp-deps-bot GitHub App installation token
+# (MACP_BOT_APP_ID / MACP_BOT_PRIVATE_KEY). A merge made with GITHUB_TOKEN starts
+# no `push` workflows on the default branch (no CI on main, no release-plz, no
+# image build) — macp-ci#1. Dependabot-triggered runs only see *Dependabot*
+# secrets, so both names exist as org Dependabot secrets too. If the secrets are
+# absent the workflow falls back to github.token (old behaviour).
+#
+# 0.x crates/packages: a 0.x minor bump (0.32 -> 0.33) is breaking under SemVer
+# §4 / Cargo, but fetch-metadata reports it as semver-minor. It is held like a
+# major.
+#
+# Each repo calls this with a thin workflow:
 #   on: pull_request
 #   permissions: { contents: write, pull-requests: write }
 #   jobs:
 #     call:
-#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1
+#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.1
+#       secrets: inherit
 
 on:
   workflow_call:
@@ -33,14 +45,46 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      HAS_APP: ${{ secrets.MACP_BOT_APP_ID != '' && secrets.MACP_BOT_PRIVATE_KEY != '' }}
     steps:
       - name: Fetch Dependabot metadata
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Enable auto-merge (patch & minor; majors held)
-        if: ${{ inputs.allow-major || steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor' }}
+      - name: Decide eligibility (patch & minor; majors and 0.x minors held)
+        id: gate
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          PREV: ${{ steps.meta.outputs.previous-version }}
+          NEW: ${{ steps.meta.outputs.new-version }}
+          ALLOW_MAJOR: ${{ inputs.allow-major }}
+        run: |
+          eligible=false
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) eligible=true ;;
+          esac
+          # 0.x: a minor change is breaking — hold it like a major.
+          prev_major="${PREV%%.*}"; prev_rest="${PREV#*.}"; prev_minor="${prev_rest%%.*}"
+          new_rest="${NEW#*.}"; new_minor="${new_rest%%.*}"
+          if [ "$UPDATE_TYPE" = "version-update:semver-minor" ] && [ "$prev_major" = "0" ] && [ "$prev_minor" != "$new_minor" ]; then
+            echo "0.x minor bump $PREV -> $NEW is breaking; holding for a human."
+            eligible=false
+          fi
+          if [ "$ALLOW_MAJOR" = "true" ]; then eligible=true; fi
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+
+      - name: Mint macp-deps-bot token
+        id: app
+        if: ${{ steps.gate.outputs.eligible == 'true' && env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.MACP_BOT_APP_ID }}
+          private-key: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
+
+      - name: Enable auto-merge
+        if: ${{ steps.gate.outputs.eligible == 'true' }}
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
