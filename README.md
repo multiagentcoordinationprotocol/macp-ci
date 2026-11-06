@@ -33,7 +33,8 @@ on: pull_request
 permissions: { contents: write, pull-requests: write }
 jobs:
   call:
-    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1
+    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.1
+    secrets: inherit   # macp-deps-bot token, so the merge push triggers main-branch CI (macp-ci#1)
 ```
 
 `bump-proto` (proto consumers) — commit `.github/workflows/bump-proto.yml`:
