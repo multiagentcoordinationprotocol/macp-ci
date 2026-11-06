@@ -26,8 +26,13 @@ name: auto-merge
 #   permissions: { contents: write, pull-requests: write }
 #   jobs:
 #     call:
-#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.1
-#       secrets: inherit
+#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.2
+#       secrets:
+#         MACP_BOT_APP_ID: ${{ secrets.MACP_BOT_APP_ID }}
+#         MACP_BOT_PRIVATE_KEY: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
+#
+# Pass only these two secrets — not `secrets: inherit` — so a moved tag can
+# never reach a caller's other secrets.
 
 on:
   workflow_call:
@@ -37,6 +42,13 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      MACP_BOT_APP_ID:
+        description: 'macp-deps-bot App ID (optional; falls back to github.token)'
+        required: false
+      MACP_BOT_PRIVATE_KEY:
+        description: 'macp-deps-bot private key (optional; falls back to github.token)'
+        required: false
 
 jobs:
   auto-merge:

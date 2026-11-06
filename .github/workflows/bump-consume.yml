@@ -27,9 +27,11 @@ name: bump-consume
 #     workflow_dispatch:   { inputs: { version: { required: false, default: '' } } }
 #   jobs:
 #     bump:
-#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/bump-consume.yml@v1
+#       uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/bump-consume.yml@v1.2
 #       with:  { ecosystem: cargo, package: macp-proto }
-#       secrets: inherit
+#       secrets:   # only the bot credentials, never `inherit`
+#         MACP_BOT_APP_ID: ${{ secrets.MACP_BOT_APP_ID }}
+#         MACP_BOT_PRIVATE_KEY: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
 
 on:
   workflow_call:
@@ -52,6 +54,13 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      MACP_BOT_APP_ID:
+        description: 'macp-deps-bot App ID'
+        required: true
+      MACP_BOT_PRIVATE_KEY:
+        description: 'macp-deps-bot private key'
+        required: true
 
 jobs:
   bump:
