@@ -33,8 +33,10 @@ on: pull_request
 permissions: { contents: write, pull-requests: write }
 jobs:
   call:
-    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.1
-    secrets: inherit   # macp-deps-bot token, so the merge push triggers main-branch CI (macp-ci#1)
+    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/auto-merge.yml@v1.2
+    secrets:   # only the bot credentials, never `inherit` (macp-ci#1)
+      MACP_BOT_APP_ID: ${{ secrets.MACP_BOT_APP_ID }}
+      MACP_BOT_PRIVATE_KEY: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
 ```
 
 `bump-proto` (proto consumers) — commit `.github/workflows/bump-proto.yml`:
@@ -46,9 +48,11 @@ on:
   workflow_dispatch:   { inputs: { version: { required: false, default: '' } } }
 jobs:
   bump:
-    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/bump-consume.yml@v1
+    uses: multiagentcoordinationprotocol/macp-ci/.github/workflows/bump-consume.yml@v1.2
     with:  { ecosystem: cargo, package: macp-proto }   # per repo, see matrix
-    secrets: inherit
+    secrets:   # only the bot credentials, never `inherit`
+      MACP_BOT_APP_ID: ${{ secrets.MACP_BOT_APP_ID }}
+      MACP_BOT_PRIVATE_KEY: ${{ secrets.MACP_BOT_PRIVATE_KEY }}
 ```
 
 ### Ecosystem per consumer
